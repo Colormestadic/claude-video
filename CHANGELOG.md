@@ -27,6 +27,23 @@ Fork of `bradautomates/claude-video`. Upstream is unchanged except where listed.
   configurability, and the setup gate. Existing keyless setup tests now pin
   `WATCH_LOCAL_WHISPER_BIN` off so they stay meaningful on a machine that has whisper installed.
 
+### Fixed (post-review, 2026-08-28)
+- **`--start/--end` now trims the audio before transcription** instead of transcribing the whole file
+  and filtering the result. Focusing a section of a long captionless file previously saved nothing;
+  on the CPU-bound local backend that was the difference between seconds and many minutes. Segments
+  are shifted back into absolute source time, so callers see no change.
+- **Default local model is the multilingual `small`, not `small.en`.** Whisper's `.en` models force
+  English rather than detecting it, so a keyless machine silently returned garbage for any
+  non-English source. English-only is now opt-in via `WATCH_LOCAL_MODEL=small.en`.
+- **`setup.py` run directly no longer reports a working local-only install as a failed setup.**
+  `cmd_install` checked `_have_api_key()` alone, so it printed "one step left: add a Whisper API key"
+  and exited 3 on a machine that could already transcribe. It now uses the same
+  `has_key or has_local` rule as `_status()`.
+- **GATE 0 no longer routes to a skill that may not exist.** It named `/cms-content-cloner`
+  unconditionally, which is not bundled here and is named differently on Codex, so on other installs
+  the gate stopped `/watch` and left no path at all. It now looks for a teardown skill on the current
+  host and, when none exists, proceeds while labelling the output ingestion rather than analysis.
+
 ### Changed
 - Local audio is never chunked. Chunking exists only to stay under the APIs' 25 MB upload cap; the
   local backend uploads nothing and windows long audio itself, so splitting would add seams for no

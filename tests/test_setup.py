@@ -125,3 +125,27 @@ def test_api_key_still_wins_over_local(tmp_path):
     assert js["whisper_backend"] == "groq"
     assert js["has_api_key"] is True
     assert js["local_whisper"] is True
+
+
+def test_installer_reports_ready_on_a_keyless_local_machine(tmp_path):
+    """cmd_install must use the same readiness rule as _status().
+
+    Checking only for an API key reports a working local-only install as a
+    failed setup and exits 3, every time the installer is run.
+    """
+    fake = tmp_path / "bin" / "whisper"
+    fake.parent.mkdir(parents=True, exist_ok=True)
+    fake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake.chmod(0o755)
+
+    _write_env(tmp_path, "GROQ_API_KEY=\nOPENAI_API_KEY=\n")
+    proc = _run([], home=tmp_path, extra_env={"WATCH_LOCAL_WHISPER_BIN": str(fake)})
+    assert proc.returncode == 0, f"local-only install should succeed: {proc.stdout}{proc.stderr}"
+    assert "whisper backend: local" in proc.stdout
+    assert "one step left" not in proc.stdout
+
+    # and it must have marked setup complete, so /watch stops re-running setup
+    js = json.loads(
+        _run(["--json"], home=tmp_path, extra_env={"WATCH_LOCAL_WHISPER_BIN": str(fake)}).stdout
+    )
+    assert js["setup_complete"] is True

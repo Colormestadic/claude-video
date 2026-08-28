@@ -46,9 +46,11 @@ GROQ_MODEL = "whisper-large-v3"
 OPENAI_ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
 OPENAI_MODEL = "whisper-1"
 
-# Local backend. `small.en` is the accuracy/speed knee on Apple Silicon CPU and
-# is already cached on this machine; override with WATCH_LOCAL_MODEL.
-LOCAL_MODEL_DEFAULT = "small.en"
+# Local backend. `small` (multilingual) is the default rather than `small.en`:
+# the `.en` models FORCE English instead of detecting the language, so a keyless
+# machine would silently return garbage for any non-English source. English-only
+# work can set WATCH_LOCAL_MODEL=small.en for a small accuracy gain.
+LOCAL_MODEL_DEFAULT = "small"
 LOCAL_MODEL_ENV = "WATCH_LOCAL_MODEL"
 LOCAL_BIN_ENV = "WATCH_LOCAL_WHISPER_BIN"
 
@@ -175,17 +177,44 @@ def resolve_backend(preferred: str | None = None) -> tuple[str | None, str | Non
     return ("local", None) if find_local_whisper() else (None, None)
 
 
-def extract_audio(video_path: str, out_path: Path) -> Path:
-    """Extract mono 16kHz 64kbps mp3 — ~480 kB/min, fits any Whisper limit."""
+def extract_audio(
+    video_path: str,
+    out_path: Path,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> Path:
+    """Extract mono 16kHz 64kbps mp3 — ~480 kB/min, fits any Whisper limit.
+
+    When a range is given, only that range is decoded. This is what makes
+    `--start/--end` actually cheap: without it the whole file is transcribed and
+    the caller merely filters the result afterwards, which saves nothing. It
+    matters most for the local backend, where transcription is CPU-bound and a
+    long file can run for many minutes.
+
+    `-ss` is placed BEFORE `-i` for fast input seeking. Output timestamps
+    therefore restart at 0, so callers must shift segments back into source time.
+    """
     if shutil.which("ffmpeg") is None:
         raise SystemExit("ffmpeg is not installed. Install with: brew install ffmpeg")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    seek: list[str] = []
+    if start_seconds is not None and start_seconds > 0:
+        seek += ["-ss", f"{start_seconds:.3f}"]
+    if end_seconds is not None:
+        duration = end_seconds - (start_seconds or 0.0)
+        if duration <= 0:
+            raise SystemExit(
+                f"empty audio range: start {start_seconds} is not before end {end_seconds}"
+            )
+        seek += ["-t", f"{duration:.3f}"]
+
     cmd = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "error",
         "-y",
+        *seek,
         "-i", str(Path(video_path).resolve()),
         "-vn",
         "-acodec", "libmp3lame",
@@ -526,8 +555,14 @@ def transcribe_video(
     audio_out: Path,
     backend: str | None = None,
     api_key: str | None = None,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
 ) -> tuple[list[dict], str]:
-    """Run the full flow: extract audio → upload → parse segments.
+    """Run the full flow: extract audio → transcribe → parse segments.
+
+    When start/end are given, only that range is extracted and transcribed, and
+    the returned segments are shifted back into absolute source time so callers
+    never have to care that the audio was trimmed.
 
     Returns (segments, backend_used). Raises SystemExit on any failure.
     """
@@ -546,8 +581,11 @@ def transcribe_video(
             f"Run `python3 {setup_py}` to configure."
         )
 
-    print(f"[watch] extracting audio for Whisper ({backend})…", file=sys.stderr)
-    audio_path = extract_audio(video_path, audio_out)
+    span = ""
+    if start_seconds is not None or end_seconds is not None:
+        span = f" [{start_seconds or 0:.0f}s→{end_seconds if end_seconds is not None else 'end'}]"
+    print(f"[watch] extracting audio for Whisper ({backend}){span}…", file=sys.stderr)
+    audio_path = extract_audio(video_path, audio_out, start_seconds, end_seconds)
     audio_bytes = audio_path.stat().st_size
 
     def transcribe_one(path: Path) -> list[dict]:
@@ -581,6 +619,11 @@ def transcribe_video(
 
     if not segments:
         raise SystemExit("Whisper returned no transcript segments")
+
+    # The trimmed audio starts at 0, so put the timestamps back on the source
+    # timeline. Chunk offsets were already applied relative to that trimmed clip.
+    if start_seconds:
+        segments = shift_segments(segments, start_seconds)
 
     print(f"[watch] transcribed {len(segments)} segments via {backend}", file=sys.stderr)
     return segments, backend

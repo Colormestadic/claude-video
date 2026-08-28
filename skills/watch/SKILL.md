@@ -1,7 +1,7 @@
 ---
 name: watch
 version: "0.2.0"
-description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or local/API Whisper), and hands the result to Claude so it can answer questions about what's in the video. INGESTION ONLY. Short-form social video (Reel, TikTok, Short, competitor clip, any footage to adapt) must go to /cms-content-cloner instead. See GATE 0.
+description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or local/API Whisper), and hands the result to Claude so it can answer questions about what's in the video. INGESTION ONLY. If a content-teardown skill is installed, short-form social video (Reel, TikTok, Short, competitor clip, any footage to adapt) belongs to it, not here. See GATE 0.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
 homepage: https://github.com/bradautomates/claude-video
@@ -16,18 +16,28 @@ user-invocable: true
 ## GATE 0 — run this before anything else, every invocation
 
 This skill is an **ingestion layer**. It gives you eyes. It does not give you a teardown, and a
-confident well-formatted summary from `/watch` is the exact shortcut the house rules forbid.
+confident well-formatted summary of a viral video is not the same artifact as a structural analysis
+of why it worked.
 
 1. Ask: **is the source short-form social video?** A Reel, TikTok, Short, a competitor clip, a
    reference piece, any footage handed over to adapt or learn from. Path, URL or attachment, it
    does not matter.
-2. **If YES → STOP. Do not run any command in this file.** Say so plainly and invoke
-   `/cms-content-cloner`, which owns the DNA teardown and has its own hard stop after Step 1.
-   `/watch` may then be called *by* that skill as its Step 1 ingestion method, never instead of it.
-3. **If NO → proceed.** `/watch` owns these outright: screen recordings and bug repros, Looms and
-   meeting recordings, long-form the user just wants played back or summarized, tutorials, podcasts,
-   launch videos, and any local file that is not short-form social.
-4. **Pass condition:** you have stated which branch you took before running a command.
+2. **If NO → proceed straight to Step 0 below.** `/watch` owns these outright: screen recordings and
+   bug repros, Looms and meeting recordings, long-form the user just wants played back or summarized,
+   tutorials, podcasts, launch videos, and any local file that is not short-form social.
+3. **If YES → check whether a content-teardown skill is installed on THIS host.** Names differ per
+   host, so look for the one that exists rather than assuming:
+   - Claude Code: `/cms-content-cloner` (`~/.claude/skills/cms-content-cloner/`)
+   - Codex: `cms-content-cloner-codex` (`~/.codex/skills/cms-content-cloner-codex/`)
+   - Otherwise: any installed skill whose job is reverse-engineering short-form video.
+4. **If one exists → STOP. Do not run any command in this file.** Say so plainly and invoke it. It
+   owns the teardown. `/watch` may then be called *by* that skill as its ingestion step, never
+   instead of it.
+5. **If none exists → proceed, but say what you are and are not delivering.** Run `/watch` normally
+   and label the result **ingestion, not a teardown**: frames and a transcript, with no claim about
+   pacing ratios, psychological framework, or why the video performed. Offer those as a separate
+   piece of work rather than folding them into the report as though they were measured.
+6. **Pass condition:** you have stated which branch you took before running a command.
 
 Borderline call, or the user has already had the teardown and now wants specific frames? Ask in one
 line rather than guessing.
@@ -188,7 +198,7 @@ Focused mode is the right call for:
 - Any video longer than ~10 minutes where the user's question is about a specific part — running focused on the relevant section is far more useful than a sparse scan of the whole thing.
 - Re-runs after a full scan didn't have enough detail in some region.
 
-Transcript is auto-filtered to the same range. Frame timestamps are absolute (real video timeline, not offset-from-start).
+Transcript is auto-filtered to the same range, and when Whisper runs, the audio is **trimmed to the range before transcription** rather than filtered afterwards. Frame and transcript timestamps are absolute (real video timeline, not offset-from-start).
 
 Examples:
 ```bash
@@ -248,11 +258,21 @@ The script gets a timestamped transcript in one of two ways:
 2. **Whisper fallback.** If no captions came back (or the source is a local file), the script extracts audio (`ffmpeg -vn -ac 1 -ar 16000 -b:a 64k`, ~0.5 MB/min) and transcribes it with the first available backend:
    - **Groq** `whisper-large-v3`. Best quality and fastest, but needs `GROQ_API_KEY`.
    - **OpenAI** `whisper-1`. Needs `OPENAI_API_KEY`.
-   - **local** (CMS fork addition). Shells out to the `whisper` CLI. No key, no network, no cost, audio never leaves the machine. Model comes from `WATCH_LOCAL_MODEL` (default `small.en`); anything the local install has cached works (`tiny.en`, `base.en`, `small.en`, `medium.en`, `small`, `medium`, `large`). Point `WATCH_LOCAL_WHISPER_BIN` at the binary if it is not on `PATH`.
+   - **local** (CMS fork addition). Shells out to the `whisper` CLI. No key, no network, no cost, audio never leaves the machine. Model comes from `WATCH_LOCAL_MODEL` (default `small`); anything the local install has cached works. Point `WATCH_LOCAL_WHISPER_BIN` at the binary if it is not on `PATH`.
+
+   **The default is the multilingual `small`, not `small.en`, on purpose.** Whisper's `.en` models
+   force English rather than detecting the language, so an English-only default would silently
+   return garbage for any non-English source on a keyless machine. Set `WATCH_LOCAL_MODEL=small.en`
+   when you know the source is English and want the small accuracy gain.
 
 **Why local matters here.** Instagram, TikTok and most short-form sources ship **no native captions**, so they always fall through to Whisper. Upstream that meant the platforms we care about most were the ones forcing a paid key and sending audio to a third party. Local removes that entirely.
 
-**Cost of local:** it runs on CPU and is not instant. Rough guide on Apple Silicon for ~2 minutes of audio: `tiny.en` ~6s, `small.en` ~30-60s, `medium.en` several minutes. If a source has real captions, they are still preferred and this never runs. Drop to `--whisper local` with `WATCH_LOCAL_MODEL=tiny.en` when you only need the gist and speed matters; keep `small.en` or better when exact wording matters (hook copy, quotes, anything you will transcribe verbatim).
+**Cost of local:** it runs on CPU and is not instant. Rough guide on Apple Silicon for ~2 minutes of audio: `tiny` ~6s, `small` ~30-60s, `medium` several minutes. If a source has real captions, they are still preferred and this never runs. Use a smaller model when you only need the gist and speed matters; keep `small` or better when exact wording matters (hook copy, quotes, anything you will transcribe verbatim).
+
+**`--start/--end` makes local transcription cheap.** The range is passed into audio extraction, so
+only that window is decoded and transcribed rather than the whole file. Returned timestamps are
+still absolute source time. On a long captionless file this is the difference between seconds and
+many minutes, so focus the range whenever the question is about a specific part.
 
 Keys live in `~/.config/watch/.env`. The script prefers Groq when both keys are set, then OpenAI, then local; override with `--whisper local` (or `groq`/`openai`) to force one. Use `--no-whisper` to skip the fallback entirely.
 
@@ -260,7 +280,7 @@ Keys live in `~/.config/watch/.env`. The script prefers Groq when both keys are 
 
 - **Setup preflight failed** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (auto-installs ffmpeg/yt-dlp via brew on macOS, scaffolds the `.env`). A machine with local `whisper` installed already satisfies the transcription gate, so **do not ask for an API key when `local_whisper: true`** in the `--json` status.
 - **No transcript available** → captions missing AND every backend failed (no key, and no local `whisper` CLI). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
-- **Local whisper is slow on a long file** → this is expected, not a hang. Say so rather than killing it. For anything over ~10 minutes with no captions, prefer `--start/--end` on the section that matters, or set `WATCH_LOCAL_MODEL=tiny.en` for a first pass.
+- **Local whisper is slow on a long file** → this is expected, not a hang. Say so rather than killing it. For anything over ~10 minutes with no captions, prefer `--start/--end` on the section that matters (it now trims the audio before transcribing, so it genuinely costs less), or set a smaller `WATCH_LOCAL_MODEL` for a first pass.
 - **Long video warning printed** → acknowledge it in your answer. Offer to re-run focused on a specific section via `--start`/`--end` rather than a sparse full-video scan.
 - **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying.
 - **Whisper request fails** → the error is printed to stderr (likely: invalid key or rate limit). Audio over the API's 25 MB upload cap is split into chunks and transcribed automatically, so length alone won't fail it; if some chunks fail the transcript is partial and the dropped chunks are noted on stderr. The report will say "none available" only if every chunk fails. You can retry with `--whisper openai` if Groq failed (or vice versa).

@@ -264,7 +264,103 @@ class TestLocalBackend:
             whisper._transcribe_local(audio)
 
     def test_model_is_configurable(self, monkeypatch):
+        # _setting() also reads ~/.config/watch/.env, so a developer's real
+        # config would otherwise decide the outcome of this assertion.
+        monkeypatch.setattr(whisper, "read_env_file", lambda *a, **k: {})
         monkeypatch.delenv("WATCH_LOCAL_MODEL", raising=False)
         assert whisper.local_model() == whisper.LOCAL_MODEL_DEFAULT
         monkeypatch.setenv("WATCH_LOCAL_MODEL", "medium.en")
         assert whisper.local_model() == "medium.en"
+
+    def test_config_file_can_set_the_model(self, monkeypatch):
+        monkeypatch.delenv("WATCH_LOCAL_MODEL", raising=False)
+        monkeypatch.setattr(whisper, "read_env_file",
+                            lambda *a, **k: {"WATCH_LOCAL_MODEL": "large"})
+        assert whisper.local_model() == "large"
+
+
+def _make_av_clip(path: Path, seconds: float = 6.0) -> None:
+    """A clip with a real audio track, so extract_audio has something to trim."""
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-t", str(seconds), "-i", "color=c=black:s=160x120:r=10",
+         "-f", "lavfi", "-t", str(seconds), "-i", "sine=frequency=440:sample_rate=16000",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(path)],
+        check=True, capture_output=True,
+    )
+
+
+class TestFocusRangeTrimsAudio:
+    """--start/--end must trim BEFORE transcription, not filter after.
+
+    Filtering a full-file transcript costs exactly as much as not focusing at
+    all. On the local backend that is the difference between seconds and many
+    minutes, which is what makes the documented "focus a section of a long
+    file" advice real rather than decorative.
+    """
+
+    def test_extract_audio_honours_the_range(self, tmp_path):
+        clip = tmp_path / "av.mp4"
+        _make_av_clip(clip, seconds=6.0)
+
+        full = whisper.extract_audio(str(clip), tmp_path / "full.mp3")
+        windowed = whisper.extract_audio(
+            str(clip), tmp_path / "win.mp3", start_seconds=2.0, end_seconds=4.0
+        )
+
+        assert whisper.audio_duration(full) == pytest.approx(6.0, abs=0.5)
+        assert whisper.audio_duration(windowed) == pytest.approx(2.0, abs=0.5)
+        assert windowed.stat().st_size < full.stat().st_size
+
+    def test_start_only_runs_to_the_end(self, tmp_path):
+        clip = tmp_path / "av.mp4"
+        _make_av_clip(clip, seconds=6.0)
+        out = whisper.extract_audio(str(clip), tmp_path / "tail.mp3", start_seconds=4.0)
+        assert whisper.audio_duration(out) == pytest.approx(2.0, abs=0.5)
+
+    def test_inverted_range_is_rejected(self, tmp_path):
+        clip = tmp_path / "av.mp4"
+        _make_av_clip(clip, seconds=3.0)
+        with pytest.raises(SystemExit, match="empty audio range"):
+            whisper.extract_audio(
+                str(clip), tmp_path / "bad.mp3", start_seconds=2.0, end_seconds=1.0
+            )
+
+    def test_segments_come_back_in_absolute_source_time(self, tmp_path, monkeypatch):
+        """Trimmed audio restarts at 0; the caller must still see source time."""
+        monkeypatch.setattr(whisper, "extract_audio",
+                            lambda v, out, s=None, e=None: _touch(out))
+        monkeypatch.setattr(whisper, "_transcribe_file",
+                            lambda b, k, p: [{"start": 0.0, "end": 3.0, "text": "spoken here"}])
+
+        segments, backend = whisper.transcribe_video(
+            "ignored.mp4", tmp_path / "audio.mp3",
+            backend="local", start_seconds=90.0, end_seconds=120.0,
+        )
+        assert backend == "local"
+        assert segments == [{"start": 90.0, "end": 93.0, "text": "spoken here"}]
+
+    def test_no_range_leaves_timestamps_untouched(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(whisper, "extract_audio",
+                            lambda v, out, s=None, e=None: _touch(out))
+        monkeypatch.setattr(whisper, "_transcribe_file",
+                            lambda b, k, p: [{"start": 0.0, "end": 3.0, "text": "spoken here"}])
+        segments, _ = whisper.transcribe_video(
+            "ignored.mp4", tmp_path / "audio.mp3", backend="local"
+        )
+        assert segments == [{"start": 0.0, "end": 3.0, "text": "spoken here"}]
+
+
+def _touch(out: Path) -> Path:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(b"\x00" * 32)
+    return out
+
+
+def test_default_local_model_is_multilingual():
+    """`.en` models FORCE English rather than detecting it, so a keyless machine
+    would silently return garbage for any non-English source."""
+    assert not whisper.LOCAL_MODEL_DEFAULT.endswith(".en"), (
+        "the default local model must auto-detect language; "
+        "English-only is opt-in via WATCH_LOCAL_MODEL"
+    )

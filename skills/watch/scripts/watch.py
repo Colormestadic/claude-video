@@ -246,6 +246,10 @@ def main() -> int:
                     work / "audio.mp3",
                     backend=backend,
                     api_key=api_key,
+                    # Trim before transcribing, not after. Filtering the result
+                    # of a full-file pass costs the same as not focusing at all.
+                    start_seconds=start_sec if focused else None,
+                    end_seconds=end_sec if focused else None,
                 )
                 transcript_segments = filter_range(all_segments, start_sec, end_sec) if focused else all_segments
                 transcript_text = format_transcript(transcript_segments)

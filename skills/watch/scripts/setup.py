@@ -351,16 +351,24 @@ def cmd_install() -> int:
     else:
         print(f"[setup] config exists: {CONFIG_FILE}")
 
+    # Readiness here must match _status(): local whisper transcribes with no key
+    # at all, so a keyless machine that has it is DONE, not one step short. Using
+    # _have_api_key() alone reports a working install as a failed one and exits 3.
     has_key, backend = _have_api_key()
-    if has_key:
+    has_local = _have_local_whisper()
+    if has_key or has_local:
         _write_setup_complete()
-        print(f"[setup] ready. whisper backend: {backend}")
+        print(f"[setup] ready. whisper backend: {backend or 'local'}")
+        if not has_key:
+            print("[setup] using local whisper: free, offline, no API key needed.")
+            print(f"[setup] model: set WATCH_LOCAL_MODEL in {CONFIG_FILE} (default: small).")
         if installed_deps:
             print("[setup] installed dependencies; /watch is fully set up.")
         return 0
 
     print("")
-    print("[setup] one step left: add a Whisper API key.")
+    print("[setup] one step left: add a Whisper API key, or install local whisper")
+    print("        (`pip install -U openai-whisper`) for a free offline transcript.")
     print("")
     print(f"  Edit {CONFIG_FILE} and set either:")
     print("    GROQ_API_KEY=...    (preferred — cheaper, faster; get one at console.groq.com/keys)")
