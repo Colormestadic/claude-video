@@ -1,6 +1,7 @@
 """Whisper auto-chunking: plan, split, and timestamp stitching."""
 from __future__ import annotations
 
+import json
 import math
 import subprocess
 from pathlib import Path
@@ -155,3 +156,115 @@ class TestTranscribeChunks:
 
         with pytest.raises(SystemExit):
             whisper.transcribe_chunks(chunks, always_fail)
+
+
+class TestLocalBackend:
+    """The CMS fork's keyless offline backend.
+
+    Every test pins WATCH_LOCAL_WHISPER_BIN and clears the API-key env vars, so
+    results never depend on what the developer's machine happens to have.
+    """
+
+    @staticmethod
+    def _fake_whisper(tmp_path: Path, payload: str = "", exit_code: int = 0) -> Path:
+        """A stand-in CLI that writes <stem>.json into --output_dir, like the real one."""
+        script = tmp_path / "fake-whisper"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            f"if {exit_code} != 0:\n"
+            "    print('boom', file=sys.stderr)\n"
+            f"    raise SystemExit({exit_code})\n"
+            "args = sys.argv[1:]\n"
+            "audio = Path(args[0])\n"
+            "out = Path(args[args.index('--output_dir') + 1])\n"
+            "out.mkdir(parents=True, exist_ok=True)\n"
+            f"payload = {payload!r}\n"
+            "(out / (audio.stem + '.json')).write_text(payload, encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        return script
+
+    @pytest.fixture(autouse=True)
+    def _no_api_keys(self, monkeypatch):
+        monkeypatch.delenv("GROQ_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        # load_api_key also reads ~/.config/watch/.env; point HOME at nothing.
+        monkeypatch.setattr(whisper, "load_api_key", lambda preferred=None: (None, None))
+
+    def test_resolve_falls_back_to_local_when_no_key(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WATCH_LOCAL_WHISPER_BIN", str(self._fake_whisper(tmp_path)))
+        assert whisper.resolve_backend() == ("local", None)
+
+    def test_resolve_returns_nothing_when_local_absent(self, monkeypatch):
+        monkeypatch.setenv("WATCH_LOCAL_WHISPER_BIN", "/nonexistent/whisper")
+        assert whisper.resolve_backend() == (None, None)
+
+    def test_forced_local_needs_the_binary(self, monkeypatch):
+        monkeypatch.setenv("WATCH_LOCAL_WHISPER_BIN", "/nonexistent/whisper")
+        assert whisper.resolve_backend("local") == (None, None)
+
+    def test_api_key_wins_over_local_in_auto_mode(self, tmp_path, monkeypatch):
+        """Local is the fallback, not an override — large-v3 beats a small local model."""
+        monkeypatch.setenv("WATCH_LOCAL_WHISPER_BIN", str(self._fake_whisper(tmp_path)))
+        monkeypatch.setattr(whisper, "load_api_key", lambda preferred=None: ("groq", "sk-test"))
+        assert whisper.resolve_backend() == ("groq", "sk-test")
+
+    def test_parses_real_whisper_cli_json_shape(self, tmp_path, monkeypatch):
+        """The CLI's JSON carries the same {segments:[{start,end,text}]} the APIs return."""
+        payload = json.dumps({
+            "text": " full thing",
+            "language": "en",
+            "segments": [
+                {"id": 0, "seek": 0, "start": 0.0, "end": 8.76, "text": " first line",
+                 "tokens": [1, 2], "temperature": 0.0, "avg_logprob": -0.3,
+                 "compression_ratio": 1.4, "no_speech_prob": 0.01},
+                {"id": 1, "seek": 0, "start": 8.76, "end": 12.5, "text": " second line",
+                 "tokens": [3], "temperature": 0.0, "avg_logprob": -0.2,
+                 "compression_ratio": 1.2, "no_speech_prob": 0.02},
+            ],
+        })
+        monkeypatch.setenv("WATCH_LOCAL_WHISPER_BIN", str(self._fake_whisper(tmp_path, payload)))
+        audio = tmp_path / "audio.mp3"
+        audio.write_bytes(b"\x00")
+
+        segments = whisper._transcribe_local(audio)
+        assert segments == [
+            {"start": 0.0, "end": 8.76, "text": "first line"},
+            {"start": 8.76, "end": 12.5, "text": "second line"},
+        ]
+
+    def test_dispatches_through_transcribe_file_with_no_key(self, tmp_path, monkeypatch):
+        payload = json.dumps({"text": "hi", "segments": [
+            {"start": 0.0, "end": 1.0, "text": " hi"}]})
+        monkeypatch.setenv("WATCH_LOCAL_WHISPER_BIN", str(self._fake_whisper(tmp_path, payload)))
+        audio = tmp_path / "audio.mp3"
+        audio.write_bytes(b"\x00")
+
+        assert whisper._transcribe_file("local", None, audio) == [
+            {"start": 0.0, "end": 1.0, "text": "hi"}
+        ]
+
+    def test_cli_failure_surfaces_as_systemexit(self, tmp_path, monkeypatch):
+        monkeypatch.setenv(
+            "WATCH_LOCAL_WHISPER_BIN", str(self._fake_whisper(tmp_path, exit_code=2))
+        )
+        audio = tmp_path / "audio.mp3"
+        audio.write_bytes(b"\x00")
+        with pytest.raises(SystemExit, match="local whisper failed"):
+            whisper._transcribe_local(audio)
+
+    def test_missing_binary_is_a_clear_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("WATCH_LOCAL_WHISPER_BIN", "/nonexistent/whisper")
+        audio = tmp_path / "audio.mp3"
+        audio.write_bytes(b"\x00")
+        with pytest.raises(SystemExit, match="Local whisper is not installed"):
+            whisper._transcribe_local(audio)
+
+    def test_model_is_configurable(self, monkeypatch):
+        monkeypatch.delenv("WATCH_LOCAL_MODEL", raising=False)
+        assert whisper.local_model() == whisper.LOCAL_MODEL_DEFAULT
+        monkeypatch.setenv("WATCH_LOCAL_MODEL", "medium.en")
+        assert whisper.local_model() == "medium.en"

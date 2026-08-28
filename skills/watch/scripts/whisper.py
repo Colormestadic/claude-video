@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""Transcribe a video via Groq or OpenAI Whisper API.
+"""Transcribe a video via local Whisper, or the Groq / OpenAI Whisper API.
 
-Strategy: extract audio (mono 16kHz mp3, tiny payload), upload to whichever
-API has a key. Returns segments in the same shape as transcribe.parse_vtt so
-the rest of the pipeline (filter_range, format_transcript) doesn't care where
-the transcript came from.
+Strategy: extract audio (mono 16kHz mp3, tiny payload), then either run the
+locally installed `whisper` CLI or upload to whichever API has a key. Returns
+segments in the same shape as transcribe.parse_vtt so the rest of the pipeline
+(filter_range, format_transcript) doesn't care where the transcript came from.
 
-Pure stdlib — no `pip install groq` or `pip install openai` needed.
+The `local` backend is a CMS fork addition. Upstream is API-only, which makes
+the platforms with no native captions (Instagram, TikTok) the exact case that
+forces a third-party key and sends audio off the machine. Local costs nothing,
+runs offline, and never leaves the laptop.
+
+Pure stdlib — no `pip install groq` or `pip install openai` needed. The local
+backend shells out to the `whisper` CLI rather than importing it, so this file
+stays importable on a machine that has no torch.
 """
 from __future__ import annotations
 
@@ -26,11 +33,29 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 
+SCRIPT_DIR = Path(__file__).parent.resolve()
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from config import read_env_file  # noqa: E402
+
+
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_MODEL = "whisper-large-v3"
 
 OPENAI_ENDPOINT = "https://api.openai.com/v1/audio/transcriptions"
 OPENAI_MODEL = "whisper-1"
+
+# Local backend. `small.en` is the accuracy/speed knee on Apple Silicon CPU and
+# is already cached on this machine; override with WATCH_LOCAL_MODEL.
+LOCAL_MODEL_DEFAULT = "small.en"
+LOCAL_MODEL_ENV = "WATCH_LOCAL_MODEL"
+LOCAL_BIN_ENV = "WATCH_LOCAL_WHISPER_BIN"
+
+# Backend preference when none is forced. Local goes last so an existing Groq
+# key keeps upstream behaviour (large-v3 is better than a small local model);
+# it is the only backend that needs no key, so it is the guaranteed fallback.
+BACKEND_ORDER = ("groq", "openai", "local")
 
 # Both Groq's free tier and OpenAI whisper-1 cap uploads at 25 MB. We target a
 # margin under that so multipart framing overhead never pushes a chunk over.
@@ -110,6 +135,44 @@ def load_api_key(preferred: str | None = None) -> tuple[str, str] | tuple[None, 
             return backend, value
 
     return None, None
+
+
+def _setting(name: str) -> str | None:
+    """Read a non-secret setting from the environment, then ~/.config/watch/.env."""
+    value = os.environ.get(name)
+    if value and value.strip():
+        return value.strip()
+    value = read_env_file().get(name)
+    return value.strip() if value and value.strip() else None
+
+
+def local_model() -> str:
+    return _setting(LOCAL_MODEL_ENV) or LOCAL_MODEL_DEFAULT
+
+
+def find_local_whisper() -> str | None:
+    """Absolute path to the local `whisper` CLI, or None if it is not installed."""
+    override = _setting(LOCAL_BIN_ENV)
+    if override:
+        return override if Path(override).exists() else None
+    return shutil.which("whisper")
+
+
+def resolve_backend(preferred: str | None = None) -> tuple[str | None, str | None]:
+    """Return (backend, api_key). `api_key` is None for the keyless local backend.
+
+    Honours an explicit `preferred` backend; otherwise walks BACKEND_ORDER and
+    returns the first that is actually usable on this machine.
+    """
+    if preferred == "local":
+        return ("local", None) if find_local_whisper() else (None, None)
+    if preferred in ("groq", "openai"):
+        return load_api_key(preferred)
+
+    backend, api_key = load_api_key()
+    if backend:
+        return backend, api_key
+    return ("local", None) if find_local_whisper() else (None, None)
 
 
 def extract_audio(video_path: str, out_path: Path) -> Path:
@@ -400,8 +463,55 @@ def transcribe_chunks(
     return segments
 
 
-def _transcribe_file(backend: str, api_key: str, audio_path: Path) -> list[dict]:
-    """Upload one audio file and return its 0-based segments."""
+def _transcribe_local(audio_path: Path) -> list[dict]:
+    """Transcribe one audio file with the local `whisper` CLI.
+
+    Writes JSON beside the audio and parses it. The CLI's JSON carries the same
+    {segments: [{start, end, text}]} shape the APIs return, so it feeds straight
+    into _segments_from_response.
+    """
+    binary = find_local_whisper()
+    if binary is None:
+        raise SystemExit(
+            "Local whisper is not installed. Install with: pip install -U openai-whisper "
+            f"(or set {LOCAL_BIN_ENV} to its path)."
+        )
+
+    model = local_model()
+    out_dir = audio_path.parent / "local-whisper"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        binary,
+        str(audio_path),
+        "--model", model,
+        "--output_format", "json",
+        "--output_dir", str(out_dir),
+        "--verbose", "False",
+    ]
+    print(f"[watch] local whisper ({model}) — this runs on CPU and is not instant…", file=sys.stderr)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        tail = (result.stderr or "").strip().splitlines()[-3:]
+        raise SystemExit(
+            f"local whisper failed (exit {result.returncode}): {' / '.join(tail) or 'no stderr'}"
+        )
+
+    json_path = out_dir / f"{audio_path.stem}.json"
+    if not json_path.exists():
+        raise SystemExit(f"local whisper wrote no JSON at {json_path}")
+    try:
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"could not read local whisper output: {exc}") from exc
+
+    return _segments_from_response(data)
+
+
+def _transcribe_file(backend: str, api_key: str | None, audio_path: Path) -> list[dict]:
+    """Transcribe one audio file and return its 0-based segments."""
+    if backend == "local":
+        return _transcribe_local(audio_path)
     if backend == "groq":
         response = _post_whisper(GROQ_ENDPOINT, api_key, GROQ_MODEL, audio_path)
     elif backend == "openai":
@@ -421,16 +531,18 @@ def transcribe_video(
 
     Returns (segments, backend_used). Raises SystemExit on any failure.
     """
-    if backend is None or api_key is None:
-        detected_backend, detected_key = load_api_key()
-        backend = backend or detected_backend
+    if backend is None:
+        backend, detected_key = resolve_backend()
         api_key = api_key or detected_key
+    elif backend != "local" and api_key is None:
+        _, api_key = load_api_key(backend)
 
-    if not backend or not api_key:
+    if not backend or (backend != "local" and not api_key):
         setup_py = Path(__file__).resolve().parent / "setup.py"
         raise SystemExit(
-            "No Whisper API key available. Set GROQ_API_KEY (preferred) or OPENAI_API_KEY "
-            "in the environment or in ~/.config/watch/.env. "
+            "No transcription backend available. Install local whisper "
+            "(`pip install -U openai-whisper`) for a free offline transcript, or set "
+            "GROQ_API_KEY / OPENAI_API_KEY in the environment or in ~/.config/watch/.env. "
             f"Run `python3 {setup_py}` to configure."
         )
 
@@ -441,7 +553,16 @@ def transcribe_video(
     def transcribe_one(path: Path) -> list[dict]:
         return _transcribe_file(backend, api_key, path)
 
-    if audio_bytes <= MAX_UPLOAD_BYTES:
+    # Chunking exists only to stay under the APIs' 25 MB upload cap. The local
+    # backend uploads nothing and windows long audio itself, so splitting it
+    # would only add seams for no benefit.
+    if backend == "local":
+        print(
+            f"[watch] audio: {audio_bytes / 1024:.0f} kB — transcribing locally…",
+            file=sys.stderr,
+        )
+        segments = transcribe_one(audio_path)
+    elif audio_bytes <= MAX_UPLOAD_BYTES:
         print(
             f"[watch] audio: {audio_bytes / 1024:.0f} kB — uploading to {backend} Whisper…",
             file=sys.stderr,
@@ -467,7 +588,7 @@ def transcribe_video(
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("usage: whisper.py <video-path> [<audio-out.mp3>] [--backend groq|openai]", file=sys.stderr)
+        print("usage: whisper.py <video-path> [<audio-out.mp3>] [--backend local|groq|openai]", file=sys.stderr)
         raise SystemExit(2)
 
     video = sys.argv[1]

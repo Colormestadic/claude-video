@@ -121,6 +121,19 @@ def _have_api_key() -> tuple[bool, str | None]:
     return False, None
 
 
+def _have_local_whisper() -> bool:
+    """True if the keyless local `whisper` CLI can serve as the fallback.
+
+    CMS fork: local whisper makes transcription available with no key at all,
+    so its presence must satisfy the same gate an API key does. Without this,
+    setup nags forever on a machine that can already transcribe.
+    """
+    override = _read_env_key("WATCH_LOCAL_WHISPER_BIN")
+    if override:
+        return Path(override).exists()
+    return shutil.which("whisper") is not None
+
+
 def is_first_run() -> bool:
     """True if the installer hasn't completed successfully yet."""
     return _read_env_key("SETUP_COMPLETE") != "true"
@@ -228,18 +241,24 @@ def _status() -> dict:
     """
     missing = _check_binaries()
     has_key, backend = _have_api_key()
+    has_local = _have_local_whisper()
     setup_complete = not is_first_run()
 
-    if not missing and has_key:
+    # Either a key or local whisper makes transcription possible.
+    can_transcribe = has_key or has_local
+    if not backend and has_local:
+        backend = "local"
+
+    if not missing and can_transcribe:
         status = "ready"
-    elif missing and not has_key:
+    elif missing and not can_transcribe:
         status = "needs_install_and_key"
     elif missing:
         status = "needs_install"
     else:
         status = "needs_key"
 
-    can_proceed = (not missing) and (has_key or setup_complete)
+    can_proceed = (not missing) and (can_transcribe or setup_complete)
 
     cfg = get_config()
     return {
@@ -250,6 +269,7 @@ def _status() -> dict:
         "missing_binaries": missing,
         "whisper_backend": backend,
         "has_api_key": has_key,
+        "local_whisper": has_local,
         "config_file": str(CONFIG_FILE),
         "watch_detail": cfg["detail"],
         "platform": platform.system(),
@@ -275,8 +295,8 @@ def cmd_check() -> int:
     parts = []
     if s["missing_binaries"]:
         parts.append(f"missing binaries: {', '.join(s['missing_binaries'])}")
-    if not s["has_api_key"] and not s["setup_complete"]:
-        parts.append("no Whisper API key (GROQ_API_KEY or OPENAI_API_KEY)")
+    if not s["has_api_key"] and not s["local_whisper"] and not s["setup_complete"]:
+        parts.append("no transcription backend (local whisper, GROQ_API_KEY, or OPENAI_API_KEY)")
     installer = Path(__file__).resolve()
     sys.stderr.write(
         f"[watch] setup incomplete ({'; '.join(parts)}). "
@@ -284,7 +304,7 @@ def cmd_check() -> int:
     )
     sys.stderr.flush()
 
-    if s["missing_binaries"] and not s["has_api_key"]:
+    if s["missing_binaries"] and not (s["has_api_key"] or s["local_whisper"]):
         return 4
     if s["missing_binaries"]:
         return 2

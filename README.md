@@ -2,6 +2,12 @@
 
 **Give Claude the ability to watch any video.**
 
+> **CMS fork.** Diverges from [`bradautomates/claude-video`](https://github.com/bradautomates/claude-video)
+> in two ways: a keyless **`local` Whisper backend** (free, offline, audio never leaves the machine,
+> which matters because Instagram and TikTok ship no native captions and always fall through to
+> Whisper), and **GATE 0** in `SKILL.md` routing short-form social video to `/cms-content-cloner`
+> for a DNA teardown instead. See the CHANGELOG. Everything else is upstream.
+
 Claude Code (recommended — auto-updates via marketplace):
 ```
 /plugin marketplace add bradautomates/claude-video

@@ -2,6 +2,36 @@
 
 All notable changes to `/watch` are documented here.
 
+## [Unreleased] — CMS fork (Colormestadic/claude-video)
+
+Fork of `bradautomates/claude-video`. Upstream is unchanged except where listed.
+
+### Added
+- **`local` Whisper backend.** Shells out to the `whisper` CLI: no API key, no network, no cost, and
+  the audio never leaves the machine. Model from `WATCH_LOCAL_MODEL` (default `small.en`); binary
+  from `WATCH_LOCAL_WHISPER_BIN` when it is not on `PATH`. Force it with `--whisper local`.
+  Rationale: Instagram, TikTok and most short-form sources ship no native captions, so they always
+  fall through to Whisper. API-only made the platforms we use most the exact case that required a
+  paid key and shipped audio to a third party.
+- Backend resolution helper `resolve_backend()`, replacing direct `load_api_key()` calls at the
+  `watch.py` call site. Order is Groq, then OpenAI, then local: an existing key keeps upstream
+  behaviour (large-v3 beats a small local model), and local is the guaranteed keyless fallback.
+- `setup.py` counts local whisper as satisfying the transcription gate, so a machine that can
+  already transcribe for free is never nagged to buy an API key. New `local_whisper` field in
+  `--json`; `has_api_key` stays truthful and is not set by the local backend.
+- **GATE 0 in `SKILL.md`.** House rule: short-form social video (Reel, TikTok, Short, competitor
+  clip) routes to `/cms-content-cloner` for a DNA teardown instead. `/watch` is an ingestion layer
+  and may be called *by* that skill, never instead of it. It still owns screen recordings, bug
+  repros, Looms, meetings, tutorials, podcasts and long-form playback outright.
+- Tests: local backend resolution and precedence, real-CLI JSON parsing, failure surfacing, model
+  configurability, and the setup gate. Existing keyless setup tests now pin
+  `WATCH_LOCAL_WHISPER_BIN` off so they stay meaningful on a machine that has whisper installed.
+
+### Changed
+- Local audio is never chunked. Chunking exists only to stay under the APIs' 25 MB upload cap; the
+  local backend uploads nothing and windows long audio itself, so splitting would add seams for no
+  benefit.
+
 ## [0.2.0] — 2026-06-29
 
 ### Added

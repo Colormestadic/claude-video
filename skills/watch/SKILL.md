@@ -1,7 +1,7 @@
 ---
 name: watch
 version: "0.2.0"
-description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or Whisper API fallback), and hands the result to Claude so it can answer questions about what's in the video.
+description: Watch a video (URL or local path). Downloads with yt-dlp, extracts auto-scaled frames with ffmpeg, pulls the transcript from captions (or local/API Whisper), and hands the result to Claude so it can answer questions about what's in the video. INGESTION ONLY. Short-form social video (Reel, TikTok, Short, competitor clip, any footage to adapt) must go to /cms-content-cloner instead. See GATE 0.
 argument-hint: "<video-url-or-path> [question]"
 allowed-tools: Bash, Read, AskUserQuestion
 homepage: https://github.com/bradautomates/claude-video
@@ -13,7 +13,28 @@ user-invocable: true
 
 # /watch
 
-You don't have a video input; this skill gives you one. A Python script gets captions first, optionally downloads the video, extracts frames as JPEGs (scene-aware, or fast keyframes at `efficient` detail), gets a timestamped transcript (native captions first, then Whisper API as fallback), and prints frame paths. You then `Read` each frame path to see the images and combine them with the transcript to answer the user.
+## GATE 0 — run this before anything else, every invocation
+
+This skill is an **ingestion layer**. It gives you eyes. It does not give you a teardown, and a
+confident well-formatted summary from `/watch` is the exact shortcut the house rules forbid.
+
+1. Ask: **is the source short-form social video?** A Reel, TikTok, Short, a competitor clip, a
+   reference piece, any footage handed over to adapt or learn from. Path, URL or attachment, it
+   does not matter.
+2. **If YES → STOP. Do not run any command in this file.** Say so plainly and invoke
+   `/cms-content-cloner`, which owns the DNA teardown and has its own hard stop after Step 1.
+   `/watch` may then be called *by* that skill as its Step 1 ingestion method, never instead of it.
+3. **If NO → proceed.** `/watch` owns these outright: screen recordings and bug repros, Looms and
+   meeting recordings, long-form the user just wants played back or summarized, tutorials, podcasts,
+   launch videos, and any local file that is not short-form social.
+4. **Pass condition:** you have stated which branch you took before running a command.
+
+Borderline call, or the user has already had the teardown and now wants specific frames? Ask in one
+line rather than guessing.
+
+---
+
+You don't have a video input; this skill gives you one. A Python script gets captions first, optionally downloads the video, extracts frames as JPEGs (scene-aware, or fast keyframes at `efficient` detail), gets a timestamped transcript (native captions first, then Whisper - local by default on this machine, API if a key is set), and prints frame paths. You then `Read` each frame path to see the images and combine them with the transcript to answer the user.
 
 ## Resolve `SKILL_DIR` (do this before any command)
 
@@ -147,8 +168,9 @@ Optional flags:
 - `--resolution W` — change frame width in px (default 512; bump to 1024 only if the user needs to read on-screen text)
 - `--fps F` — override auto-fps (clamped to 2 fps max)
 - `--out-dir DIR` — keep working files somewhere specific (default: an auto-generated tmp dir)
-- `--whisper groq|openai` — force a specific Whisper backend (default: prefer Groq if both keys exist)
+- `--whisper local|groq|openai` — force a specific Whisper backend. Default order: Groq, then OpenAI, then `local`. **On this machine there is no API key, so `local` is what runs.**
 - `--no-whisper` — disable the Whisper fallback entirely (frames-only if no captions)
+- `--detail transcript --whisper local` — the cheapest useful pass on a captionless source: no frames, free offline transcript.
 - `--no-dedup` — keep near-duplicate frames. By default a frame-delta pass drops frames that are visually near-identical to the previous kept one (held slides, static screen recordings, paused video) so the frame budget goes to distinct content; the report's **Frames** line notes how many were dropped. Pass this only if the user needs every sampled frame (e.g. judging subtle frame-to-frame motion).
 
 ### Focusing on a section (higher frame rate)
@@ -223,16 +245,22 @@ Behavior:
 The script gets a timestamped transcript in one of two ways:
 
 1. **Native captions (free, preferred).** yt-dlp pulls manual or auto-generated subtitles from the source platform if available.
-2. **Whisper API fallback.** If no captions came back (or the source is a local file), the script extracts audio (`ffmpeg -vn -ac 1 -ar 16000 -b:a 64k`, ~0.5 MB/min) and uploads it to whichever Whisper API has a key configured:
-   - **Groq** — `whisper-large-v3`. Preferred default: cheaper, faster. Get a key at console.groq.com/keys.
-   - **OpenAI** — `whisper-1`. Fallback. Get a key at platform.openai.com/api-keys.
+2. **Whisper fallback.** If no captions came back (or the source is a local file), the script extracts audio (`ffmpeg -vn -ac 1 -ar 16000 -b:a 64k`, ~0.5 MB/min) and transcribes it with the first available backend:
+   - **Groq** `whisper-large-v3`. Best quality and fastest, but needs `GROQ_API_KEY`.
+   - **OpenAI** `whisper-1`. Needs `OPENAI_API_KEY`.
+   - **local** (CMS fork addition). Shells out to the `whisper` CLI. No key, no network, no cost, audio never leaves the machine. Model comes from `WATCH_LOCAL_MODEL` (default `small.en`); anything the local install has cached works (`tiny.en`, `base.en`, `small.en`, `medium.en`, `small`, `medium`, `large`). Point `WATCH_LOCAL_WHISPER_BIN` at the binary if it is not on `PATH`.
 
-Both keys live in `~/.config/watch/.env`. The script prefers Groq when both are set; override with `--whisper openai` to force OpenAI. Use `--no-whisper` to skip the fallback entirely.
+**Why local matters here.** Instagram, TikTok and most short-form sources ship **no native captions**, so they always fall through to Whisper. Upstream that meant the platforms we care about most were the ones forcing a paid key and sending audio to a third party. Local removes that entirely.
+
+**Cost of local:** it runs on CPU and is not instant. Rough guide on Apple Silicon for ~2 minutes of audio: `tiny.en` ~6s, `small.en` ~30-60s, `medium.en` several minutes. If a source has real captions, they are still preferred and this never runs. Drop to `--whisper local` with `WATCH_LOCAL_MODEL=tiny.en` when you only need the gist and speed matters; keep `small.en` or better when exact wording matters (hook copy, quotes, anything you will transcribe verbatim).
+
+Keys live in `~/.config/watch/.env`. The script prefers Groq when both keys are set, then OpenAI, then local; override with `--whisper local` (or `groq`/`openai`) to force one. Use `--no-whisper` to skip the fallback entirely.
 
 ## Failure modes and handling
 
-- **Setup preflight failed** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (auto-installs ffmpeg/yt-dlp via brew on macOS, scaffolds the `.env`). For API key, ask the user via `AskUserQuestion` and write it to `~/.config/watch/.env`.
-- **No transcript available** → captions missing AND (no Whisper key OR Whisper API failed). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
+- **Setup preflight failed** → run `python3 "${SKILL_DIR}/scripts/setup.py"` (auto-installs ffmpeg/yt-dlp via brew on macOS, scaffolds the `.env`). A machine with local `whisper` installed already satisfies the transcription gate, so **do not ask for an API key when `local_whisper: true`** in the `--json` status.
+- **No transcript available** → captions missing AND every backend failed (no key, and no local `whisper` CLI). Script prints a hint pointing to setup. Proceed frames-only and tell the user.
+- **Local whisper is slow on a long file** → this is expected, not a hang. Say so rather than killing it. For anything over ~10 minutes with no captions, prefer `--start/--end` on the section that matters, or set `WATCH_LOCAL_MODEL=tiny.en` for a first pass.
 - **Long video warning printed** → acknowledge it in your answer. Offer to re-run focused on a specific section via `--start`/`--end` rather than a sparse full-video scan.
 - **Download fails** → yt-dlp's error goes to stderr. If it's a login-required or region-locked video, tell the user plainly; do not keep retrying.
 - **Whisper request fails** → the error is printed to stderr (likely: invalid key or rate limit). Audio over the API's 25 MB upload cap is split into chunks and transcribed automatically, so length alone won't fail it; if some chunks fail the transcript is partial and the dropped chunks are noted on stderr. The report will say "none available" only if every chunk fails. You can retry with `--whisper openai` if Groq failed (or vice versa).
@@ -251,6 +279,7 @@ If you already watched a video this session and the user asks a follow-up, do **
 **What this skill does:**
 - Runs `yt-dlp` locally to download the video and pull native captions when the source supports them (public data; the request goes directly to whatever host the URL points at)
 - Runs `ffmpeg` / `ffprobe` locally to extract frames as JPEGs and, when Whisper is needed, a mono 16 kHz audio clip
+- Runs the local `whisper` CLI when no API key is set. **Nothing leaves the machine on this path** — no network call, no upload, no third party
 - Sends the extracted audio clip to Groq's Whisper API (`api.groq.com/openai/v1/audio/transcriptions`) when `GROQ_API_KEY` is set (preferred — cheaper, faster)
 - Sends the extracted audio clip to OpenAI's audio transcription API (`api.openai.com/v1/audio/transcriptions`) when `OPENAI_API_KEY` is set and Groq is not, or when `--whisper openai` is forced
 - Writes the downloaded video, frames, audio, and an intermediate transcript to a working directory under the system temp dir (or `--out-dir` if specified) so Claude can `Read` them
